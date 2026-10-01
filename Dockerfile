@@ -22,7 +22,7 @@ RUN apk update && apk add --no-cache \
         yq \
         bind-tools
 COPY --from=build /dist/ziti_router_auto_enroll /
-COPY ./docker-entrypoint.sh /
+COPY ./docker-entrypoint.sh ./aer-lib.sh /
 RUN chmod +x /docker-entrypoint.sh /ziti_router_auto_enroll
 
 ENTRYPOINT ["/docker-entrypoint.sh"]
