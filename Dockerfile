@@ -20,7 +20,8 @@ RUN apk update && apk add --no-cache \
         iproute2 \
         systemd \
         yq \
-        bind-tools
+        bind-tools \
+        openssl
 COPY --from=build /dist/ziti_router_auto_enroll /
 COPY ./docker-entrypoint.sh ./aer-lib.sh /
 RUN chmod +x /docker-entrypoint.sh /ziti_router_auto_enroll

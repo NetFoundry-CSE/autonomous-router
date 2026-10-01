@@ -10,6 +10,7 @@
 # auto_enroll argv and the config.yml rendering can be exercised in isolation.
 
 AER_CONFIG_FILE="${AER_CONFIG_FILE:-/etc/netfoundry/config.yml}"
+AER_CERT_DIR="${AER_CERT_DIR:-/etc/netfoundry/certs}"
 
 ############### Logging ###############
 
@@ -194,6 +195,9 @@ FX_validate_env() {
         _DNS_ACTIVE=true
     fi
 
+    SUBFX_validate_advertise
+    SUBFX_validate_link_listener
+
     # Parsed even when unused so a typo fails here, not after a mode change.
     SUBFX_parse_upstreams
 
@@ -204,6 +208,77 @@ FX_validate_env() {
             warn "ZITI_DNS_UPSTREAM is ignored: TUNNEL_MODE=${AER_TUNNEL_MODE} runs no Ziti DNS server"
         fi
     fi
+}
+
+# Sets AER_EDGE_ADVERTISE_HOST from ADVERTISE_ADDRESS (HOST:PORT).
+# IPv6 is rejected: auto_enroll derives the cert SAN with split(":"), which
+# cannot handle IPv6 literals.
+SUBFX_validate_advertise() {
+    AER_EDGE_ADVERTISE_HOST=""
+    [[ -n "${ADVERTISE_ADDRESS:-}" ]] || return 0
+
+    local host="" port=""
+    if [[ "${ADVERTISE_ADDRESS}" =~ ^([^:]+):([0-9]+)$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
+    fi
+    if [[ -z "${host}" ]] || ! SUBFX_is_port "${port}" \
+        || ! { SUBFX_is_ipv4 "${host}" || SUBFX_is_dns_name "${host}"; }; then
+        err "ADVERTISE_ADDRESS='${ADVERTISE_ADDRESS}' is invalid; expected HOST:PORT with an IPv4 address or DNS name (IPv6 is not supported), e.g. 203.0.113.10:443"
+    fi
+    AER_EDGE_ADVERTISE_HOST="${host}"
+}
+
+# Sets AER_LINK_STATE (true | false | unmanaged) and, when true,
+# AER_LINK_BIND, AER_LINK_ADVERTISE_HOST, AER_LINK_ADVERTISE, AER_LINK_OUTQ.
+#   ZITI_LINK_LISTENER_ENABLED unset  -> config.yml link listeners left as-is
+#   ZITI_LINK_LISTENER_ENABLED=false  -> link listeners removed
+#   ZITI_LINK_LISTENER_ENABLED=true   -> exactly one transport link listener
+SUBFX_validate_link_listener() {
+    local enabled="${ZITI_LINK_LISTENER_ENABLED:-}"
+    enabled="${enabled//[[:space:]]/}"
+    case "${enabled,,}" in
+        "")          AER_LINK_STATE="unmanaged" ;;
+        true|yes|1)  AER_LINK_STATE="true" ;;
+        false|no|0)  AER_LINK_STATE="false" ;;
+        *) err "ZITI_LINK_LISTENER_ENABLED='${ZITI_LINK_LISTENER_ENABLED}' is invalid; allowed values: true, false (or unset to leave config.yml link listeners unchanged)" ;;
+    esac
+
+    AER_LINK_ADVERTISE=""
+    if [[ "${AER_LINK_STATE}" != "true" ]]; then
+        if [[ -n "${ZITI_LINK_ADVERTISE:-}" ]]; then
+            warn "ZITI_LINK_ADVERTISE is ignored: set ZITI_LINK_LISTENER_ENABLED=true to configure a link listener"
+        fi
+        return 0
+    fi
+
+    local adv="${ZITI_LINK_ADVERTISE:-}"
+    adv="${adv//[[:space:]]/}"
+    [[ -n "${adv}" ]] \
+        || err "ZITI_LINK_ADVERTISE is required when ZITI_LINK_LISTENER_ENABLED=true; set it to the public IPv4 address or DNS name other routers will dial"
+    if [[ "${adv}" == *:* ]]; then
+        err "ZITI_LINK_ADVERTISE='${adv}' is invalid; allowed values: an IPv4 address or DNS name (IPv6 and HOST:PORT are not supported; set the port with ZITI_LINK_ADVERTISE_PORT)"
+    fi
+    SUBFX_is_ipv4 "${adv}" || SUBFX_is_dns_name "${adv}" \
+        || err "ZITI_LINK_ADVERTISE='${adv}' is invalid; allowed values: an IPv4 address or DNS name"
+
+    local port="${ZITI_LINK_ADVERTISE_PORT:-443}"
+    SUBFX_is_port "${port}" \
+        || err "ZITI_LINK_ADVERTISE_PORT='${port}' is invalid; allowed values: 1-65535 (default 443)"
+
+    local bind="${ZITI_LINK_BIND:-tls:0.0.0.0:443}" bind_port=""
+    [[ "${bind}" =~ ^tls:[^[:space:]]+:([0-9]+)$ ]] && bind_port="${BASH_REMATCH[1]}"
+    SUBFX_is_port "${bind_port}" \
+        || err "ZITI_LINK_BIND='${bind}' is invalid; expected tls:ADDRESS:PORT (default tls:0.0.0.0:443)"
+
+    local outq="${ZITI_LINK_OUTQUEUESIZE:-16}"
+    [[ "${outq}" =~ ^[0-9]+$ ]] && (( 10#${outq} > 0 )) \
+        || err "ZITI_LINK_OUTQUEUESIZE='${outq}' is invalid; expected a positive integer (default 16)"
+
+    AER_LINK_BIND="${bind}"
+    AER_LINK_ADVERTISE_HOST="${adv}"
+    AER_LINK_ADVERTISE="tls:${adv}:${port}"
+    AER_LINK_OUTQ="$((10#${outq}))"
 }
 
 ############### auto_enroll arguments ###############
@@ -267,6 +342,12 @@ FX_build_enroll_args() {
         ${version_args}
         --skipSystemd)
 
+    # Explicit --linkListeners wins over auto_enroll's own defaults and puts
+    # the advertise host into the cert SANs.  --assumePublic is not used.
+    if [[ "${AER_LINK_STATE}" == "true" ]]; then
+        AER_ENROLL_ARGS+=(--linkListeners transport "${AER_LINK_BIND}" "${AER_LINK_ADVERTISE}" "${AER_LINK_OUTQ}")
+    fi
+
     # auto_enroll only touches DNS when a tunnel flag is present, but say so
     # explicitly for none.
     if [[ "${AER_TUNNEL_MODE}" == "none" ]]; then
@@ -329,6 +410,139 @@ SUBFX_set_tunnel_binding() {
     fi
 }
 
+############### Certificate SAN checks ###############
+# Listeners present server_cert.pem, whose SANs were fixed at enrollment.  An
+# advertised address the cert does not cover breaks TLS verification for
+# whoever dials it, and only re-enrollment can add a SAN.
+
+# Returns 0 if host $1 is covered by the router cert SANs, 1 if not, and 2 if
+# that cannot be checked (no cert yet, or openssl unavailable).  Sets
+# AER_CERT_PATH and AER_CERT_SANS for messages.
+SUBFX_cert_has_san() {
+    local host="${1,,}" f san sans
+    AER_CERT_PATH=""
+    AER_CERT_SANS=""
+    for f in server_cert.pem cert.pem client.cert; do
+        if [[ -s "${AER_CERT_DIR}/${f}" ]]; then
+            AER_CERT_PATH="${AER_CERT_DIR}/${f}"
+            break
+        fi
+    done
+    [[ -n "${AER_CERT_PATH}" ]] || return 2
+    command -v openssl >/dev/null 2>&1 || return 2
+
+    sans=$(openssl x509 -in "${AER_CERT_PATH}" -noout -ext subjectAltName 2>/dev/null \
+        | sed -n '2,$p' | tr ',' '\n' \
+        | sed 's/^[[:space:]]*//; s/^IP Address:/IP:/' \
+        | grep -E '^(DNS|IP):' || true)
+    AER_CERT_SANS=$(echo "${sans}" | tr '\n' ' ')
+    AER_CERT_SANS="${AER_CERT_SANS% }"
+
+    while read -r san; do
+        case "${san}" in
+            IP:*)
+                [[ "${san#IP:}" == "${host}" ]] && return 0 ;;
+            DNS:*)
+                san="${san#DNS:}"
+                san="${san,,}"
+                [[ "${san}" == "${host}" ]] && return 0
+                # Single-label wildcard: *.corp.example matches er1.corp.example.
+                if [[ "${san}" == \*.* ]] && ! SUBFX_is_ipv4 "${host}" \
+                    && [[ "${host}" == *.* && "${host#*.}" == "${san#\*.}" ]]; then
+                    return 0
+                fi ;;
+        esac
+    done <<< "${sans}"
+    return 1
+}
+
+# Checks that $2 (the host behind env var $1) is in the cert SANs.
+# $3=change: config.yml is about to be changed to use it, so a missing SAN is
+# fatal.  $3=keep: config.yml already uses it, so only warn.
+SUBFX_require_san() {
+    local var="$1" host="$2" intent="$3" rc=0
+    SUBFX_cert_has_san "${host}" || rc=$?
+    case "${rc}" in
+        0) return 0 ;;
+        2) warn "Cannot verify ${var} host '${host}' against the router certificate (${AER_CERT_PATH:-no cert found}); continuing" ;;
+        *)
+            if [[ "${intent}" == "change" ]]; then
+                err "${var}: '${host}' is not in the router certificate SANs (${AER_CERT_PATH}: ${AER_CERT_SANS})." \
+                    "Advertising an address the certificate does not cover requires re-enrollment:" \
+                    "stop the container, move ./ziti_router aside, and start again with a new REG_KEY" \
+                    "from the NetFoundry console (or revert ${var})."
+            fi
+            warn "!!! ${var}: '${host}' is in config.yml but NOT in the router certificate SANs"
+            warn "!!! (${AER_CERT_PATH}: ${AER_CERT_SANS}).  Clients dialing it will fail TLS"
+            warn "!!! verification.  Re-enroll the router to add it to the certificate." ;;
+    esac
+}
+
+############### Listener reconciliation ###############
+
+# Applies ADVERTISE_ADDRESS to the edge listener.  Unset leaves it alone:
+# auto_enroll's defaults depend on the LAN IP at enrollment time, and
+# re-detecting them would break the router whenever DHCP moves it.
+SUBFX_reconcile_edge_advertise() {
+    local cfg="$1" count cur
+    [[ -n "${ADVERTISE_ADDRESS:-}" ]] || return 0
+
+    count=$(yq e '[.listeners[] | select(.binding == "edge")] | length' "${cfg}")
+    if [[ "${count}" -eq 0 ]]; then
+        warn "ADVERTISE_ADDRESS is set but config.yml has no edge listener; not applied"
+        return 0
+    fi
+    cur=$(yq e '[.listeners[] | select(.binding == "edge")] | .[0].options.advertise // ""' "${cfg}")
+
+    if [[ "${cur}" == "${ADVERTISE_ADDRESS}" ]]; then
+        SUBFX_require_san ADVERTISE_ADDRESS "${AER_EDGE_ADVERTISE_HOST}" keep
+        return 0
+    fi
+
+    SUBFX_require_san ADVERTISE_ADDRESS "${AER_EDGE_ADVERTISE_HOST}" change
+    log "Changing edge listener advertise from '${cur}' to '${ADVERTISE_ADDRESS}'"
+    EDGE_ADVERTISE="${ADVERTISE_ADDRESS}" \
+        yq e -i '(.listeners[] | select(.binding == "edge") | .options.advertise) = strenv(EDGE_ADVERTISE)' "${cfg}"
+    ok "Edge listener advertise set to ${ADVERTISE_ADDRESS}"
+}
+
+# Applies AER_LINK_STATE to link.listeners (see SUBFX_validate_link_listener).
+# The listener shape matches auto_enroll's template, so a router enrolled
+# with the same settings is not rewritten.
+SUBFX_reconcile_link_listener() {
+    local cfg="$1" cur want
+    local expr='[{"binding": "transport", "bind": strenv(LINK_BIND), "advertise": strenv(LINK_ADVERTISE), "options": {"outQueueSize": env(LINK_OUTQ)}}]'
+
+    case "${AER_LINK_STATE}" in
+        unmanaged)
+            return 0 ;;
+        false)
+            [[ "$(yq e '.link.listeners | length' "${cfg}")" -gt 0 ]] || return 0
+            log "ZITI_LINK_LISTENER_ENABLED=false — removing link listeners from config.yml"
+            yq e -i 'del(.link.listeners)' "${cfg}"
+            ok "Link listeners removed"
+            return 0 ;;
+    esac
+
+    export LINK_BIND="${AER_LINK_BIND}" LINK_ADVERTISE="${AER_LINK_ADVERTISE}" LINK_OUTQ="${AER_LINK_OUTQ}"
+    cur=$(yq e -o=json -I=0 '.link.listeners // []' "${cfg}")
+    want=$(yq -n -o=json -I=0 "${expr}")
+
+    if [[ "${cur}" == "${want}" ]]; then
+        SUBFX_require_san ZITI_LINK_ADVERTISE "${AER_LINK_ADVERTISE_HOST}" keep
+    else
+        SUBFX_require_san ZITI_LINK_ADVERTISE "${AER_LINK_ADVERTISE_HOST}" change
+        log "Setting link listener: bind ${AER_LINK_BIND}, advertise ${AER_LINK_ADVERTISE}, outQueueSize ${AER_LINK_OUTQ}"
+        yq e -i ".link.listeners = ${expr}" "${cfg}"
+        ok "Link listener set to ${AER_LINK_ADVERTISE}"
+    fi
+    unset LINK_BIND LINK_ADVERTISE LINK_OUTQ
+
+    if [[ "$(yq e '[.link.dialers[] | select(.binding == "transport")] | length' "${cfg}")" -eq 0 ]]; then
+        warn "config.yml has no link dialer with binding 'transport'; this router will accept links but not dial them"
+    fi
+}
+
 # Applies the validated env to config.yml.  Call after enrollment and
 # FX_validate_env, with ZITI_VERSION set to the installed binary's version.
 FX_render_config() {
@@ -344,6 +558,8 @@ FX_render_config() {
     AER_UPSTREAM_TRUNCATED=false
 
     SUBFX_reconcile_tunnel_binding "${cfg}"
+    SUBFX_reconcile_edge_advertise "${cfg}"
+    SUBFX_reconcile_link_listener "${cfg}"
 
     if [[ "${_DNS_ACTIVE}" == "true" ]]; then
         SUBFX_dns_update_config_yaml
@@ -418,10 +634,16 @@ SUBFX_dns_update_config_yaml() {
 # One line with the effective settings, logged after every render.
 FX_log_summary() {
     local upstream_desc="n/a (DNS management inactive)"
+    local link_desc="${AER_LINK_ADVERTISE}"
+    case "${AER_LINK_STATE}" in
+        unmanaged) link_desc="unmanaged (config.yml left as-is)" ;;
+        false)     link_desc="disabled" ;;
+    esac
     if [[ "${_DNS_ACTIVE}" == "true" ]]; then
         upstream_desc="[${AER_FINAL_UPSTREAMS[*]}] truncated=${AER_UPSTREAM_TRUNCATED}"
     fi
     log "Effective settings: tunnel=${AER_TUNNEL_MODE}" \
         "| dnsUpstream=${upstream_desc}" \
+        "| linkAdvertise=${link_desc}" \
         "| routerVersion=${ZITI_VERSION:-unknown}"
 }
