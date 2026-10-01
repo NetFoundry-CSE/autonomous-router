@@ -201,13 +201,23 @@ FX_validate_env() {
     # Parsed even when unused so a typo fails here, not after a mode change.
     SUBFX_parse_upstreams
 
-    if [[ -n "${ZITI_DNS_UPSTREAM:-}" && "${_DNS_ACTIVE}" != "true" ]]; then
+    local upstream_mode="${ZITI_DNS_UPSTREAM_MODE:-}"
+    upstream_mode="${upstream_mode//[[:space:]]/}"
+    upstream_mode="${upstream_mode,,}"
+    case "${upstream_mode}" in
+        ""|parallel|serial|failover|random) AER_DNS_UPSTREAM_MODE="${upstream_mode}" ;;
+        *) err "ZITI_DNS_UPSTREAM_MODE='${ZITI_DNS_UPSTREAM_MODE}' is invalid; allowed values: parallel, serial, failover, random (case-insensitive, or unset)" ;;
+    esac
+
+    local var
+    for var in ZITI_DNS_UPSTREAM ZITI_DNS_UPSTREAM_MODE; do
+        [[ -n "${!var:-}" && "${_DNS_ACTIVE}" != "true" ]] || continue
         if [[ "${AER_TUNNEL_MODE}" == "auto" ]]; then
-            warn "ZITI_DNS_UPSTREAM is ignored: ZITI_DNS_CONFIGURE=false"
+            warn "${var} is ignored: ZITI_DNS_CONFIGURE=false"
         else
-            warn "ZITI_DNS_UPSTREAM is ignored: TUNNEL_MODE=${AER_TUNNEL_MODE} runs no Ziti DNS server"
+            warn "${var} is ignored: TUNNEL_MODE=${AER_TUNNEL_MODE} runs no Ziti DNS server"
         fi
-    fi
+    done
 }
 
 # Sets AER_EDGE_ADVERTISE_HOST from ADVERTISE_ADDRESS (HOST:PORT).
@@ -556,6 +566,7 @@ FX_render_config() {
     SUBFX_parse_version "${ZITI_VERSION:-}" && AER_VERSION_KNOWN=true
     AER_FINAL_UPSTREAMS=()
     AER_UPSTREAM_TRUNCATED=false
+    AER_UPSTREAM_MODE_STATUS="not applied"
 
     SUBFX_reconcile_tunnel_binding "${cfg}"
     SUBFX_reconcile_edge_advertise "${cfg}"
@@ -629,6 +640,31 @@ SUBFX_dns_update_config_yaml() {
             -i "${config_file}"
         ok "dnsUpstream set to [${upstreams[*]}]"
     fi
+
+    # dnsUpstreamMode only exists in ziti >= 2.1.0, but 2.0.x reads tunnel
+    # options by known key and ignores it, so it is not version-gated.  With a
+    # single upstream there is nothing to order, so it is left out.
+    AER_UPSTREAM_MODE_STATUS="unset"
+    if [[ -n "${AER_DNS_UPSTREAM_MODE}" ]]; then
+        if [[ ${#upstreams[@]} -ge 2 ]]; then
+            DNS_UPSTREAM_MODE="${AER_DNS_UPSTREAM_MODE}" \
+                yq e '(.listeners[] | select(.binding == "tunnel") | .options.dnsUpstreamMode) = strenv(DNS_UPSTREAM_MODE)' \
+                -i "${config_file}"
+            ok "dnsUpstreamMode set to ${AER_DNS_UPSTREAM_MODE}"
+            AER_UPSTREAM_MODE_STATUS="emitted"
+            if ! { [[ "${AER_VERSION_KNOWN}" == "true" ]] && SUBFX_version_ge 2 1 0; }; then
+                log "dnsUpstreamMode is ignored by router ${ZITI_VERSION:-unknown}; it takes effect once the router runs ziti >= 2.1.0"
+            fi
+        else
+            log "ZITI_DNS_UPSTREAM_MODE=${AER_DNS_UPSTREAM_MODE} not written: only one dnsUpstream is configured"
+            AER_UPSTREAM_MODE_STATUS="skipped, single upstream"
+        fi
+    fi
+    if [[ "${AER_UPSTREAM_MODE_STATUS}" != "emitted" ]] \
+        && [[ -n "$(yq e '[.listeners[] | select(.binding == "tunnel") | .options.dnsUpstreamMode // ""] | join("")' "${config_file}")" ]]; then
+        yq e -i 'del(.listeners[] | select(.binding == "tunnel") | .options.dnsUpstreamMode)' "${config_file}"
+        ok "dnsUpstreamMode removed"
+    fi
 }
 
 # One line with the effective settings, logged after every render.
@@ -644,6 +680,7 @@ FX_log_summary() {
     fi
     log "Effective settings: tunnel=${AER_TUNNEL_MODE}" \
         "| dnsUpstream=${upstream_desc}" \
+        "| dnsUpstreamMode=${AER_DNS_UPSTREAM_MODE:-unset} (${AER_UPSTREAM_MODE_STATUS})" \
         "| linkAdvertise=${link_desc}" \
         "| routerVersion=${ZITI_VERSION:-unknown}"
 }
