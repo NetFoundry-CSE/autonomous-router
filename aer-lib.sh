@@ -55,6 +55,121 @@ SUBFX_detect_iface_ipv4() {
     ip -4 -o addr show dev "$1" 2>/dev/null | awk '{split($4, a, "/"); print a[1]; exit}'
 }
 
+############### Address + version helpers ###############
+
+SUBFX_is_ipv4() {
+    local octet
+    [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    for octet in "${BASH_REMATCH[@]:1}"; do
+        (( 10#${octet} <= 255 )) || return 1
+    done
+}
+
+# Loose IPv6 check: hex digits, colons and dots, with at least two colons.
+SUBFX_is_ipv6() {
+    local colons="${1//[^:]/}"
+    [[ "$1" =~ ^[0-9A-Fa-f:.]+$ && ${#colons} -ge 2 ]]
+}
+
+SUBFX_is_dns_name() {
+    local name="${1%.}"
+    local label='[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
+    [[ -n "${name}" && ${#name} -le 253 ]] || return 1
+    [[ "${name}" =~ ^${label}(\.${label})*$ ]] || return 1
+    # All-numeric dotted strings are malformed IPv4 addresses, not names.
+    [[ ! "${name}" =~ ^[0-9.]+$ ]]
+}
+
+SUBFX_is_port() {
+    [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+
+# Normalises one dnsUpstream entry and prints it:
+#   1.1.1.1 | dns.corp       -> udp://HOST:53
+#   HOST:PORT                -> udp://HOST:PORT
+#   2001:db8::1 | [v6]:PORT  -> udp://[v6]:53 | udp://[v6]:PORT
+#   udp://... | tcp://...    -> unchanged
+# On failure prints the reason and returns 1.
+SUBFX_normalize_upstream() {
+    local entry="$1" host port
+    local re_scheme='^([A-Za-z][A-Za-z0-9+.-]*)://(.*)$'
+    local re_v6='^\[([^]]+)\](:([0-9]+))?$'
+    local re_hostport='^([^:]+):([0-9]+)$'
+
+    if [[ "${entry}" =~ ${re_scheme} ]]; then
+        case "${BASH_REMATCH[1],,}" in
+            udp|tcp)
+                [[ -n "${BASH_REMATCH[2]}" ]] || { echo "missing host after scheme"; return 1; }
+                echo "${BASH_REMATCH[1],,}://${BASH_REMATCH[2]}"
+                return 0 ;;
+            *)
+                echo "unsupported scheme '${BASH_REMATCH[1]}://'"
+                return 1 ;;
+        esac
+    elif [[ "${entry}" =~ ${re_v6} ]]; then
+        host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[3]:-53}"
+        SUBFX_is_ipv6 "${host}" || { echo "'${host}' is not an IPv6 address"; return 1; }
+        host="[${host}]"
+    elif SUBFX_is_ipv6 "${entry}"; then
+        host="[${entry}]"
+        port=53
+    elif [[ "${entry}" =~ ${re_hostport} ]]; then
+        host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
+    else
+        host="${entry}"
+        port=53
+    fi
+
+    if [[ "${host}" != \[* ]] && ! SUBFX_is_ipv4 "${host}" && ! SUBFX_is_dns_name "${host}"; then
+        echo "'${host}' is not a valid IP address or hostname"
+        return 1
+    fi
+    SUBFX_is_port "${port}" || { echo "port '${port}' is out of range 1-65535"; return 1; }
+    echo "udp://${host}:${port}"
+}
+
+# Sets AER_DNS_UPSTREAMS from ZITI_DNS_UPSTREAM: comma and/or whitespace
+# separated, normalised, de-duplicated with order preserved (order matters
+# for the serial and failover query modes).
+SUBFX_parse_upstreams() {
+    AER_DNS_UPSTREAMS=()
+    local -a raw=()
+    local entry norm seen dup
+    IFS=$', \t\n' read -r -d '' -a raw <<< "${ZITI_DNS_UPSTREAM:-}" || true
+
+    for entry in "${raw[@]}"; do
+        [[ -n "${entry}" ]] || continue
+        norm=$(SUBFX_normalize_upstream "${entry}") \
+            || err "ZITI_DNS_UPSTREAM entry '${entry}' is invalid (${norm}); allowed forms: IP, hostname, HOST:PORT, [IPv6]:PORT, udp://HOST:PORT, tcp://HOST:PORT"
+        dup=false
+        for seen in "${AER_DNS_UPSTREAMS[@]}"; do
+            [[ "${seen}" == "${norm}" ]] && dup=true
+        done
+        [[ "${dup}" == "true" ]] || AER_DNS_UPSTREAMS+=("${norm}")
+    done
+}
+
+# Parses a ziti version (v1.7.2, 2.1.0-pre2, ...) into AER_VER=(major minor
+# patch).  Pre-release suffixes are ignored, so v2.1.0-pre2 counts as 2.1.0.
+# Returns 1 when the version cannot be determined.
+SUBFX_parse_version() {
+    AER_VER=()
+    [[ "${1:-}" =~ ^[[:space:]]*v?([0-9]+)\.([0-9]+)\.([0-9]+) ]] || return 1
+    AER_VER=("$((10#${BASH_REMATCH[1]}))" "$((10#${BASH_REMATCH[2]}))" "$((10#${BASH_REMATCH[3]}))")
+}
+
+# True when the parsed AER_VER is >= $1.$2.$3.
+SUBFX_version_ge() {
+    local want=("$1" "$2" "$3") i
+    for i in 0 1 2; do
+        (( AER_VER[i] > want[i] )) && return 0
+        (( AER_VER[i] < want[i] )) && return 1
+    done
+    return 0
+}
+
 ############### Environment validation ###############
 # FX_validate_env runs on every start, before registration, so a bad value
 # stops the container before anything is enrolled or rewritten.
@@ -79,8 +194,15 @@ FX_validate_env() {
         _DNS_ACTIVE=true
     fi
 
-    if [[ "${AER_TUNNEL_MODE}" == "none" && -n "${ZITI_DNS_UPSTREAM:-}" ]]; then
-        warn "ZITI_DNS_UPSTREAM is ignored: TUNNEL_MODE=none has no tunnel binding"
+    # Parsed even when unused so a typo fails here, not after a mode change.
+    SUBFX_parse_upstreams
+
+    if [[ -n "${ZITI_DNS_UPSTREAM:-}" && "${_DNS_ACTIVE}" != "true" ]]; then
+        if [[ "${AER_TUNNEL_MODE}" == "auto" ]]; then
+            warn "ZITI_DNS_UPSTREAM is ignored: ZITI_DNS_CONFIGURE=false"
+        else
+            warn "ZITI_DNS_UPSTREAM is ignored: TUNNEL_MODE=${AER_TUNNEL_MODE} runs no Ziti DNS server"
+        fi
     fi
 }
 
@@ -216,11 +338,18 @@ FX_render_config() {
         return
     fi
 
+    AER_VERSION_KNOWN=false
+    SUBFX_parse_version "${ZITI_VERSION:-}" && AER_VERSION_KNOWN=true
+    AER_FINAL_UPSTREAMS=()
+    AER_UPSTREAM_TRUNCATED=false
+
     SUBFX_reconcile_tunnel_binding "${cfg}"
 
     if [[ "${_DNS_ACTIVE}" == "true" ]]; then
         SUBFX_dns_update_config_yaml
     fi
+
+    FX_log_summary
 }
 
 SUBFX_dns_update_config_yaml() {
@@ -240,15 +369,59 @@ SUBFX_dns_update_config_yaml() {
 
     # dnsUpstream is always written — Ziti must know where to forward
     # non-overlay queries.  Auto-detect from host resolver when not set.
-    local upstream="${ZITI_DNS_UPSTREAM:-}"
-    if [[ -z "${upstream}" ]]; then
+    local upstreams=("${AER_DNS_UPSTREAMS[@]}")
+    if [[ ${#upstreams[@]} -eq 0 ]]; then
         local raw_ip
         raw_ip=$(SUBFX_dns_detect_fallback)
-        upstream="udp://${raw_ip}:53"
-        log "ZITI_DNS_UPSTREAM not set — auto-detected: ${upstream}"
+        if SUBFX_is_ipv6 "${raw_ip}"; then
+            upstreams=("udp://[${raw_ip}]:53")
+        else
+            upstreams=("udp://${raw_ip}:53")
+        fi
+        log "ZITI_DNS_UPSTREAM not set — auto-detected: ${upstreams[0]}"
     fi
-    DNS_UPSTREAM="${upstream}" \
-        yq e '(.listeners[] | select(.binding == "tunnel") | .options.dnsUpstream) = env(DNS_UPSTREAM)' \
-        -i "${config_file}"
-    ok "dnsUpstream set to ${upstream}"
+
+    # Version guard: ziti < 2.0.0 rejects anything but a string dnsUpstream
+    # (hard config error), so a list is only written when the installed
+    # binary is known to be >= 2.0.0.  Otherwise keep the first entry, which
+    # is valid on every version.
+    if [[ ${#upstreams[@]} -gt 1 ]]; then
+        if [[ "${AER_VERSION_KNOWN}" == "true" ]] && SUBFX_version_ge 2 0 0; then
+            :
+        else
+            if [[ "${AER_VERSION_KNOWN}" == "true" ]]; then
+                warn "Router ${ZITI_VERSION} accepts a single dnsUpstream; multiple upstreams require ziti >= 2.0.0."
+            else
+                warn "Router version could not be determined ('${ZITI_VERSION:-}'); writing a single dnsUpstream, which is valid on every version."
+            fi
+            warn "Using ${upstreams[0]}; dropped: ${upstreams[*]:1}"
+            upstreams=("${upstreams[0]}")
+            AER_UPSTREAM_TRUNCATED=true
+        fi
+    fi
+    AER_FINAL_UPSTREAMS=("${upstreams[@]}")
+
+    if [[ ${#upstreams[@]} -eq 1 ]]; then
+        # Single entry: scalar string, byte-identical to entrypoint v2.0.
+        DNS_UPSTREAM="${upstreams[0]}" \
+            yq e '(.listeners[] | select(.binding == "tunnel") | .options.dnsUpstream) = env(DNS_UPSTREAM)' \
+            -i "${config_file}"
+        ok "dnsUpstream set to ${upstreams[0]}"
+    else
+        DNS_UPSTREAM_LIST="$(IFS=,; echo "${upstreams[*]}")" \
+            yq e '(.listeners[] | select(.binding == "tunnel") | .options.dnsUpstream) = (strenv(DNS_UPSTREAM_LIST) | split(","))' \
+            -i "${config_file}"
+        ok "dnsUpstream set to [${upstreams[*]}]"
+    fi
+}
+
+# One line with the effective settings, logged after every render.
+FX_log_summary() {
+    local upstream_desc="n/a (DNS management inactive)"
+    if [[ "${_DNS_ACTIVE}" == "true" ]]; then
+        upstream_desc="[${AER_FINAL_UPSTREAMS[*]}] truncated=${AER_UPSTREAM_TRUNCATED}"
+    fi
+    log "Effective settings: tunnel=${AER_TUNNEL_MODE}" \
+        "| dnsUpstream=${upstream_desc}" \
+        "| routerVersion=${ZITI_VERSION:-unknown}"
 }
