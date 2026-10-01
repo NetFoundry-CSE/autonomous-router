@@ -27,6 +27,8 @@ services:
 
     # Host networking is required: the ER's DNS server must be reachable on the
     # host's loopback/LAN interface, and NET_ADMIN is needed for tun/iptables.
+    # TUNNEL_MODE=none needs neither NET_ADMIN, pid: host, nor the systemd and
+    # /etc/hosts mounts below; they are harmless to leave in place.
     network_mode: host
     # Share the host PID namespace so systemctl sees the host's
     # systemd as PID 1 and can restart systemd-resolved directly.
@@ -41,11 +43,13 @@ services:
       - REG_KEY=${REG_KEY}
 
       ## TUNNEL MODE ##
-      # "auto" enables the tunnel listener (required for DNS routing via Ziti).
-      #   Leave unset for host-only mode (no tunnel listener, no Ziti DNS server).
-      # NOTE: this is written into config.yml at registration time only.
-      #   Changing it after the router is registered has no effect.
-      #   To apply a new value: delete ./ziti_router and re-register with a new key.
+      # auto  tproxy tunnel listener + Ziti DNS server (required for DNS routing via Ziti).
+      # host  tunnel listener in host mode: hosts services, no intercept, no Ziti DNS.
+      # none  no tunnel listener at all: a plain edge/fabric router.
+      # Case-insensitive; validated on every start; unset means host.
+      # Applied to config.yml on every start, so changing it does not need
+      #   re-registration.  auto/host also need the router to be tunneler-enabled
+      #   in the NetFoundry console.
       - TUNNEL_MODE=${TUNNEL_MODE:-auto}
 
       ## VERBOSITY ##
@@ -57,7 +61,21 @@ services:
 
       # CHANGE ADVERTISED ADDRESS ##
       # Required when the host's public IP differs from its LAN IP.
+      # Format HOST:PORT (IPv4 or DNS name).  Applied on every start; the host
+      #   must already be in the router cert, or startup fails asking for
+      #   re-enrollment.
       #- ADVERTISE_ADDRESS=203.0.113.10:443
+
+      ## FABRIC LINK LISTENER ##
+      # Lets other routers dial this one.  Unset leaves config.yml as-is;
+      #   false removes any link listener.  The advertise host must be reachable
+      #   from other routers and, after enrollment, already be in the router
+      #   cert (see README).
+      #- ZITI_LINK_LISTENER_ENABLED=true
+      #- ZITI_LINK_ADVERTISE=er1.example.com     # public IPv4 or DNS name (required)
+      #- ZITI_LINK_ADVERTISE_PORT=443            # default 443
+      #- ZITI_LINK_BIND=tls:0.0.0.0:443          # default; shares 443 with the edge listener
+      #- ZITI_LINK_OUTQUEUESIZE=16               # default 16
 
       # AUTO UPDATE CONTROL ##
       # Default (unset): entrypoint polls controller every 60s and upgrades
@@ -122,10 +140,17 @@ services:
       # Upstream DNS written into config.yml dnsUpstream.
       #   Auto-detected from the host's current resolver when unset.
       #   ZITI_DNS_CONFIGURE=true is required for this.
-      #   IMPORTANT: when set explicitly, format MUST include protocol and port:
-      #     udp://IP:PORT  or  tcp://IP:PORT  — e.g. udp://1.1.1.1:53
-      #- ZITI_DNS_UPSTREAM=udp://1.1.1.1:53
+      #   One or more entries, comma and/or space separated, in order.  Each is
+      #     IP, hostname, HOST:PORT, [IPv6]:PORT, udp://HOST:PORT or tcp://HOST:PORT;
+      #     bare entries become udp://HOST:53.
+      #   More than one entry needs ziti >= 2.0.0; older routers get the first only.
+      #- ZITI_DNS_UPSTREAM=10.0.0.2, 1.1.1.1
       - ZITI_DNS_UPSTREAM=${ZITI_DNS_UPSTREAM:-}
+
+      # How Ziti queries multiple upstreams (ziti >= 2.1.0; ignored by 2.0.x).
+      #   parallel (default) | serial | failover | random.  Only written when
+      #   there are 2+ upstreams.
+      #- ZITI_DNS_UPSTREAM_MODE=failover
 
       ## STATIC /etc/hosts INJECTION ##
       # Inject records into /etc/hosts before ziti starts.  Resolved locally by

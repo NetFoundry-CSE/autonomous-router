@@ -20,18 +20,30 @@
 #                     Move DNS config to post-launch; wait for Ziti DNS ready in all-mode
 #                     Remove resolved drop-in and restart systemd-resolved on shutdown
 #                     ZITI_VERSION_OVERRIDE — pin the router binary to a specific version
+#   2.1  10/01/2026  TUNNEL_MODE=none; TUNNEL_MODE validated and applied on every start
+#                     Multiple ZITI_DNS_UPSTREAM values (version-guarded), ZITI_DNS_UPSTREAM_MODE
+#                     ZITI_LINK_* fabric link listener; ADVERTISE_ADDRESS applied post-enrollment
+#                     with a cert SAN check; rendering moved to aer-lib.sh
 #
 # Environment variables:
 #   REG_KEY                Registration key for initial router enrollment
 #   HTTPS_PROXY            Proxy URL (e.g. http://proxy.corp:3128)
-#   ADVERTISE_ADDRESS      Advertised IP:PORT for edge TLS listener
-#   TUNNEL_MODE            Set to "auto" to enable the tunnel listener (tproxy
-#                          mode).  ALL Ziti DNS features require TUNNEL_MODE=auto
-#                          — in host mode Ziti does not open a DNS port and all
-#                          ZITI_DNS_* settings are ignored entirely.
-#                          NOTE: written into config.yml at registration time.
-#                          Changing it after enrollment requires deleting
-#                          ./ziti_router and re-registering with a new key.
+#   ADVERTISE_ADDRESS      Advertised HOST:PORT for edge TLS listener (IPv4 or
+#                          DNS name).  Applied on every start; after enrollment
+#                          HOST must already be in the router cert SANs.
+#   TUNNEL_MODE            auto | host | none (case-insensitive, unset = host).
+#                          auto: tproxy tunnel listener + Ziti DNS server.
+#                          host: tunnel listener in host mode, no DNS.
+#                          none: no tunnel listener.  ALL Ziti DNS features
+#                          require TUNNEL_MODE=auto.  Validated and applied to
+#                          config.yml on every start.
+#   ZITI_LINK_LISTENER_ENABLED  true: one "transport" link listener; false:
+#                          remove link listeners; unset: leave config.yml as-is.
+#   ZITI_LINK_ADVERTISE    Public IPv4/DNS name other routers dial (required
+#                          when enabled; must be in the cert SANs after enrollment)
+#   ZITI_LINK_ADVERTISE_PORT  Default 443
+#   ZITI_LINK_BIND         Default tls:0.0.0.0:443
+#   ZITI_LINK_OUTQUEUESIZE Default 16
 #   VERBOSE                Any non-empty value enables verbose ziti logging (-v)
 #
 #   DISABLE_AUTO_UPDATE    Set to "true" to skip controller-version checks.
@@ -53,9 +65,11 @@
 #   ZITI_DNS_UPSTREAM      Upstream DNS written into config.yml dnsUpstream.
 #                          Auto-detected from the host's current resolver when
 #                          unset (same source as ZITI_DNS_FALLBACK, formatted
-#                          as udp://IP:53).  When set explicitly, format MUST
-#                          include protocol and port: udp://IP:PORT or
-#                          tcp://IP:PORT  e.g. "udp://1.1.1.1:53"
+#                          as udp://IP:53).  Comma/space separated list; bare
+#                          hosts become udp://HOST:53.  More than one entry is
+#                          written as a list only for ziti >= 2.0.0.
+#   ZITI_DNS_UPSTREAM_MODE parallel | serial | failover | random (ziti >= 2.1.0).
+#                          Written only with 2+ upstreams.
 #   ZITI_DNS_DISABLE_MDNS  Set to "true" to write MulticastDNS=no into the
 #                          resolved drop-in.  Required when your DNS server
 #                          serves .local records — without this, systemd-resolved
@@ -85,7 +99,7 @@
 
 set -eo pipefail
 
-VERSION="2.0"
+VERSION="2.1"
 SystemLogo='
     _   __     __  ______                      __
    / | / /__  / /_/ ____/___  __  ______  ____/ /______  __
