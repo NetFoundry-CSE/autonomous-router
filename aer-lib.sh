@@ -296,6 +296,7 @@ SUBFX_validate_link_listener() {
 # Builds AER_ENROLL_ARGS, the argv for /ziti_router_auto_enroll.
 # Reads: zitiVersion, upgradelink, TUNNEL_MODE, HTTPS_PROXY, ADVERTISE_ADDRESS,
 #        ZITI_VERSION_OVERRIDE
+# shellcheck disable=SC2154  # zitiVersion and upgradelink are entrypoint globals
 FX_build_enroll_args() {
     local main_ver dot_ver ctrl_port
     main_ver=$(awk -F '.' '{print $1}' <<< "${zitiVersion}")
@@ -568,13 +569,26 @@ FX_render_config() {
     AER_UPSTREAM_TRUNCATED=false
     AER_UPSTREAM_MODE_STATUS="not applied"
 
-    SUBFX_reconcile_tunnel_binding "${cfg}"
-    SUBFX_reconcile_edge_advertise "${cfg}"
-    SUBFX_reconcile_link_listener "${cfg}"
+    # Render into a scratch copy; any err() below (e.g. a missing cert SAN)
+    # exits before the live file is replaced, so config.yml is never left
+    # half-updated.  The live file is only rewritten when the content changed.
+    local work="${cfg}.aer-render"
+    cp -p "${cfg}" "${work}"
+    AER_CONFIG_FILE="${work}"
+
+    SUBFX_reconcile_tunnel_binding "${work}"
+    SUBFX_reconcile_edge_advertise "${work}"
+    SUBFX_reconcile_link_listener "${work}"
 
     if [[ "${_DNS_ACTIVE}" == "true" ]]; then
         SUBFX_dns_update_config_yaml
     fi
+
+    AER_CONFIG_FILE="${cfg}"
+    if ! cmp -s "${work}" "${cfg}"; then
+        cat "${work}" > "${cfg}"
+    fi
+    rm -f "${work}"
 
     FX_log_summary
 }
