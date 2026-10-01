@@ -594,6 +594,12 @@ cd /etc/netfoundry/
 ARCH=$(uname -m)
 log "Architecture: ${ARCH}"
 
+############### Environment validation ###############
+# Runs on every start, before registration: invalid values stop the container
+# here instead of producing a half-enrolled router or a broken config.yml.
+FX_validate_env
+log "Tunnel mode: ${AER_TUNNEL_MODE}"
+
 CERT_FILE="certs/cert.pem"
 CERT_FILE_OLD="certs/client.cert"
 
@@ -712,21 +718,18 @@ fi
 # DNS management (config.yml patches + systemd-resolved) requires TUNNEL_MODE=auto.
 # In host mode Ziti does not open a DNS port so there is nothing to configure.
 # ZITI_DNS_CONFIGURE=false can suppress DNS setup even when TUNNEL_MODE=auto.
-_DNS_ACTIVE=false
-if [[ "${TUNNEL_MODE:-}" == "auto" && "${ZITI_DNS_CONFIGURE:-true}" != "false" ]]; then
-    _DNS_ACTIVE=true
+# _DNS_ACTIVE itself is set by FX_validate_env.
+if [[ "${_DNS_ACTIVE}" == "true" ]]; then
     log "DNS management active (TUNNEL_MODE=auto)"
 else
-    log "DNS management inactive (TUNNEL_MODE=${TUNNEL_MODE:-unset} — only active when TUNNEL_MODE=auto)"
+    log "DNS management inactive (TUNNEL_MODE=${AER_TUNNEL_MODE} — only active when TUNNEL_MODE=auto)"
 fi
 
-############### Pre-launch: config.yml YAML patches ###############
+############### Pre-launch: config.yml rendering ###############
 # Must run before Ziti starts — ziti reads config.yml once at startup and
 # will not pick up changes made after it is already running.
 
-if [[ "${_DNS_ACTIVE}" == "true" ]]; then
-    SUBFX_dns_update_config_yaml
-fi
+FX_render_config
 
 ############### Pre-launch: /etc/hosts injection ###############
 # Only active in tunnel mode — in host mode Ziti does not intercept DNS so
@@ -820,6 +823,9 @@ while true; do
             wait "${ZITI_PID}" 2>/dev/null || true
             FX_upgrade_ziti
             ZITI_VERSION=$(/opt/openziti/bin/ziti -v 2>/dev/null)
+            # Re-render: version-gated settings (dnsUpstream list form) must
+            # match the binary that is about to start.
+            FX_render_config
             log "Restarting ziti-router..."
             /opt/openziti/bin/ziti router run config.yml ${OPS} &
             ZITI_PID=$!
